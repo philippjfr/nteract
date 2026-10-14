@@ -35,7 +35,10 @@ pub(crate) async fn handle(
             "Bokeh session is disconnected",
         );
     }
-    if request.base_revision != session.head_revision {
+    // The kernel applies a patch made against an older revision on top of the
+    // current document, like a Bokeh server, so only a revision the session
+    // never reached is stale.
+    if request.base_revision > session.head_revision {
         return NotebookResponse::BokehSessionPatch {
             reply: BokehSessionPatchReply::Stale {
                 session_id: request.session_id,
@@ -182,7 +185,68 @@ fn patch_error(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use runtime_doc::BokehSessionState;
+
     use super::*;
+    use crate::notebook_sync_server::NotebookRoom;
+
+    fn room_with_session(head_revision: u64) -> (tempfile::TempDir, Arc<NotebookRoom>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let room = Arc::new(NotebookRoom::new_fresh(
+            uuid::Uuid::new_v4(),
+            None,
+            tmp.path(),
+            Arc::new(BlobStore::new(tmp.path().join("blobs"))),
+            false,
+        ));
+        let session = BokehSessionState {
+            output_id: "output-1".to_string(),
+            cell_id: "cell-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            kernel_id: "kernel-1".to_string(),
+            status: BokehSessionStatus::Connected,
+            head_revision,
+            producer_name: "panel".to_string(),
+            producer_version: "1.9.3".to_string(),
+            bokeh_version: "3.9.1".to_string(),
+            root_ids: vec!["root-1".to_string()],
+            checkpoint: None,
+            patch_tail: Vec::new(),
+        };
+        room.state
+            .with_doc(|state| state.put_bokeh_session("session-1", &session))
+            .unwrap();
+        (tmp, room)
+    }
+
+    #[tokio::test]
+    async fn patch_against_older_revision_is_forwarded_for_rebase() {
+        let (_tmp, room) = room_with_session(5);
+        let mut patch = request();
+        patch.base_revision = 3;
+
+        // Without a runtime agent the request stops right before forwarding.
+        assert!(matches!(
+            handle(&room, patch).await,
+            NotebookResponse::NoKernel {}
+        ));
+    }
+
+    #[tokio::test]
+    async fn patch_ahead_of_head_revision_is_stale() {
+        let (_tmp, room) = room_with_session(5);
+        let mut patch = request();
+        patch.base_revision = 6;
+
+        assert!(matches!(
+            handle(&room, patch).await,
+            NotebookResponse::BokehSessionPatch {
+                reply: BokehSessionPatchReply::Stale { revision: 5, .. }
+            }
+        ));
+    }
 
     fn request() -> BokehSessionPatchRequest {
         BokehSessionPatchRequest {
